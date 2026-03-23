@@ -1,35 +1,29 @@
 #!/usr/bin/env python3
 """EMO BLE Bridge — HTTP API to control EMO robot via Bluetooth LE.
 
+Features:
+  - Auto-reconnect watchdog (checks every 30s)
+  - Retry on BLE errors (up to 2 retries per request)
+  - Disconnection detection via client.is_connected
+
 Endpoints:
-  GET  /health              — connection status
-  GET  /status              — full EMO status
-  GET  /connect             — force reconnect
-  GET  /disconnect          — disconnect BLE
-  GET  /dances              — available dance list
-  POST /dance               — {"num": 0-10}
-  POST /stop_dance          — exit animation mode
-  POST /move                — {"direction": "forward|back|left|right|stop"}
-  POST /animation           — {"name": "interact_emotion_happy"}
-  POST /volume              — {"level": 0-5}
-  POST /power_off           — shutdown EMO
-  POST /photo               — take photo from EMO camera, returns JPEG
-  POST /face                — {"op": "syn|add|del|rename", ...}
-  POST /raw                 — {"cmd": "JSON string"} raw BLE command
+  GET  /health, /status, /status/full, /connect, /disconnect, /dances
+  POST /dance, /stop_dance, /move, /animation, /volume, /power_off
+  POST /photo, /face, /raw
 """
 
 import asyncio
-import io
 import json
 import os
 import logging
 import socket
-import struct
 import threading
+import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 
-from bleak import BleakClient, BleakScanner, BLEDevice, AdvertisementData
+from bleak import BleakScanner, BLEDevice, AdvertisementData
+from bleak.exc import BleakError
 from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
 
 logging.basicConfig(format="[BLE] %(asctime)s %(message)s", level=logging.INFO)
@@ -40,6 +34,8 @@ PHOTO_PORT = int(os.environ.get("PHOTO_PORT", "8099"))
 EMO_ADDR = os.environ.get("EMO_ADDR", "")
 BLE_ADAPTER = os.environ.get("BLE_ADAPTER", "")
 SERVER_IP = os.environ.get("SERVER_IP", "")
+WATCHDOG_INTERVAL = int(os.environ.get("WATCHDOG_INTERVAL", "30"))
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "2"))
 
 SERVICE_UUID = "0000ffe0-0000-1000-8000-00805f9b34fb"
 CHAR_UUID = "0000ffe1-0000-1000-8000-00805f9b34fb"
@@ -67,7 +63,6 @@ def encode_cmd(data: list, sequential=True) -> bytes:
 
 
 def detect_server_ip():
-    """Detect our IP on the local network."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("192.168.1.1", 80))
@@ -88,6 +83,14 @@ class EmoConnection:
         self.loop = None
         self._buf = bytearray()
         self._expected = 0
+        self._lock = asyncio.Lock()
+        self._connect_lock = asyncio.Lock()
+        self._last_ok = 0
+        self._reconnect_count = 0
+
+    @property
+    def is_alive(self):
+        return self.connected and self.client and self.client.is_connected
 
     def _handle_rx(self, _sender, data: bytearray):
         if data[0] == 0xBB and data[1] == 0xAA:
@@ -110,43 +113,76 @@ class EmoConnection:
             self._expected = 0
 
     async def connect(self):
-        if self.connected and self.client and self.client.is_connected:
-            return True
+        async with self._connect_lock:
+            if self.is_alive:
+                return True
 
-        logger.info("Scanning for EMO...")
-        kwargs = {}
-        if BLE_ADAPTER:
-            kwargs["adapter"] = BLE_ADAPTER
+            # Clean up old connection
+            if self.client:
+                try:
+                    await self.client.disconnect()
+                except Exception:
+                    pass
+                self.client = None
+                self.char = None
+                self.connected = False
 
-        if EMO_ADDR:
-            device = await BleakScanner.find_device_by_address(EMO_ADDR, timeout=15, **kwargs)
-        else:
-            def match(d: BLEDevice, adv: AdvertisementData):
-                return SERVICE_UUID.lower() in adv.service_uuids
-            device = await BleakScanner.find_device_by_filter(match, timeout=15, **kwargs)
+            logger.info("Scanning for EMO...")
+            scan_kwargs = {"adapter": BLE_ADAPTER} if BLE_ADAPTER else {}
 
-        if not device:
-            logger.error("EMO not found")
-            return False
+            try:
+                if EMO_ADDR:
+                    device = await BleakScanner.find_device_by_address(
+                        EMO_ADDR, timeout=15, **scan_kwargs
+                    )
+                else:
+                    def match(d: BLEDevice, adv: AdvertisementData):
+                        return SERVICE_UUID.lower() in adv.service_uuids
+                    device = await BleakScanner.find_device_by_filter(
+                        match, timeout=15, **scan_kwargs
+                    )
+            except Exception as e:
+                logger.error(f"Scan error: {e}")
+                return False
 
-        logger.info(f"Found: {device.name} ({device.address})")
-        connect_kwargs = {}
-        if BLE_ADAPTER:
-            connect_kwargs["adapter"] = BLE_ADAPTER
-        self.client = await establish_connection(
-            BleakClientWithServiceCache, device, "EMO", **connect_kwargs
-        )
-        svc = self.client.services.get_service(SERVICE_UUID)
-        self.char = svc.get_characteristic(CHAR_UUID)
-        await self.client.start_notify(self.char, self._handle_rx)
-        self.connected = True
-        logger.info("Connected to EMO")
-        return True
+            if not device:
+                logger.error("EMO not found")
+                return False
+
+            logger.info(f"Found: {device.name} ({device.address})")
+            try:
+                connect_kwargs = {"adapter": BLE_ADAPTER} if BLE_ADAPTER else {}
+                self.client = await establish_connection(
+                    BleakClientWithServiceCache, device, "EMO", **connect_kwargs
+                )
+                svc = self.client.services.get_service(SERVICE_UUID)
+                self.char = svc.get_characteristic(CHAR_UUID)
+                await self.client.start_notify(self.char, self._handle_rx)
+                self.connected = True
+                self._last_ok = time.monotonic()
+                self._reconnect_count += 1
+                logger.info(f"Connected (attempt #{self._reconnect_count})")
+                return True
+            except Exception as e:
+                logger.error(f"Connect error: {e}")
+                self.connected = False
+                return False
 
     async def disconnect(self):
-        if self.client and self.client.is_connected:
-            await self.client.disconnect()
+        if self.client:
+            try:
+                await self.client.disconnect()
+            except Exception:
+                pass
+        self.client = None
+        self.char = None
         self.connected = False
+
+    async def ensure_connected(self):
+        if not self.is_alive:
+            logger.warning("Connection lost, reconnecting...")
+            return await self.connect()
+        return True
 
     async def _send_fragmented(self, payload: bytes):
         for i in range(0, len(payload), 20):
@@ -154,48 +190,82 @@ class EmoConnection:
             await asyncio.sleep(0.05)
 
     async def send_request(self, payload: bytes, timeout=5) -> dict:
-        if not self.connected:
-            await self.connect()
-        self.response = None
-        self.response_event.clear()
-        await self._send_fragmented(payload)
-        try:
-            await asyncio.wait_for(self.response_event.wait(), timeout)
-        except asyncio.TimeoutError:
-            return {"error": "timeout"}
-        return self.response or {"error": "no response"}
+        for attempt in range(MAX_RETRIES + 1):
+            if not await self.ensure_connected():
+                return {"error": "not connected"}
+            try:
+                async with self._lock:
+                    self.response = None
+                    self.response_event.clear()
+                    await self._send_fragmented(payload)
+                    try:
+                        await asyncio.wait_for(self.response_event.wait(), timeout)
+                    except asyncio.TimeoutError:
+                        return {"error": "timeout"}
+                    self._last_ok = time.monotonic()
+                    return self.response or {"error": "no response"}
+            except (BleakError, OSError, AttributeError) as e:
+                logger.warning(f"Send error (attempt {attempt+1}/{MAX_RETRIES+1}): {e}")
+                self.connected = False
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(1)
+                    continue
+                return {"error": str(e)}
 
     async def send_command(self, payload: bytes):
-        if not self.connected:
-            await self.connect()
-        await self.client.write_gatt_char(self.char, payload, response=False)
+        for attempt in range(MAX_RETRIES + 1):
+            if not await self.ensure_connected():
+                return {"error": "not connected"}
+            try:
+                await self.client.write_gatt_char(self.char, payload, response=False)
+                self._last_ok = time.monotonic()
+                return {"ok": True}
+            except (BleakError, OSError, AttributeError) as e:
+                logger.warning(f"Command error (attempt {attempt+1}): {e}")
+                self.connected = False
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(1)
+
+    # ── Watchdog ──────────────────────────────────────────────────
+
+    async def watchdog(self):
+        """Background task: check connection health every WATCHDOG_INTERVAL seconds."""
+        logger.info(f"Watchdog started (interval={WATCHDOG_INTERVAL}s)")
+        while True:
+            await asyncio.sleep(WATCHDOG_INTERVAL)
+            if not self.is_alive:
+                logger.info("Watchdog: not connected, attempting reconnect...")
+                ok = await self.connect()
+                if ok:
+                    logger.info("Watchdog: reconnected!")
+                else:
+                    logger.warning("Watchdog: reconnect failed, will retry")
 
     # ── High-level API ────────────────────────────────────────────
 
     async def get_status(self):
-        req = encode_text('{"data":{"request":[0,1,2,7,8,11,12,13,14]},"type":"sta_req"}')
-        return await self.send_request(req)
+        return await self.send_request(
+            encode_text('{"data":{"request":[0,1,2,7,8,11,12,13,14]},"type":"sta_req"}')
+        )
 
     async def get_full_status(self):
         result = {}
         for i in range(15):
-            req = encode_text(json.dumps({"data": {"request": [i]}, "type": "sta_req"}))
-            r = await self.send_request(req, timeout=3)
+            r = await self.send_request(
+                encode_text(json.dumps({"data": {"request": [i]}, "type": "sta_req"})), timeout=3
+            )
             if r and "data" in r:
                 result.update(r["data"])
             await asyncio.sleep(0.3)
         return {"type": "sta_rsp", "data": result}
 
     async def dance(self, num=0):
-        if num < 0 or num >= len(DANCE_LIST):
-            num = 0
+        num = max(0, min(num, len(DANCE_LIST) - 1))
         await self.send_request(encode_text('{"data":{"op":"in"},"type":"anim_req"}'))
         await asyncio.sleep(0.3)
-        name = DANCE_LIST[num]
-        resp = await self.send_request(
-            encode_text(json.dumps({"data": {"name": name, "op": "play"}, "type": "anim_req"}))
+        return await self.send_request(
+            encode_text(json.dumps({"data": {"name": DANCE_LIST[num], "op": "play"}, "type": "anim_req"}))
         )
-        return resp
 
     async def stop_dance(self):
         return await self.send_request(encode_text('{"data":{"op":"out"},"type":"anim_req"}'))
@@ -203,23 +273,22 @@ class EmoConnection:
     async def play_animation(self, name: str):
         await self.send_request(encode_text('{"data":{"op":"in"},"type":"anim_req"}'))
         await asyncio.sleep(0.3)
-        resp = await self.send_request(
+        return await self.send_request(
             encode_text(json.dumps({"data": {"name": name, "op": "play"}, "type": "anim_req"}))
         )
-        return resp
 
     async def move(self, direction: str):
         dirs = {"forward": 5, "back": 6, "left": 7, "right": 8, "stop": 9}
-        code = dirs.get(direction, 9)
-        await self.send_command(encode_cmd([3, 4, code], sequential=False))
+        await self.send_command(encode_cmd([3, 4, dirs.get(direction, 9)], sequential=False))
         return {"ok": True, "direction": direction}
 
     async def power_off(self):
         return await self.send_request(encode_text('{"data":{},"type":"off_req"}'))
 
     async def set_volume(self, level: int):
-        req = encode_text(json.dumps({"data": {"volume": level}, "type": "setting_req"}))
-        return await self.send_request(req)
+        return await self.send_request(
+            encode_text(json.dumps({"data": {"volume": level}, "type": "setting_req"}))
+        )
 
     async def face_op(self, data: dict):
         return await self.send_request(
@@ -227,7 +296,6 @@ class EmoConnection:
         )
 
     async def take_photo(self) -> bytes:
-        """Request photo from EMO camera via BLE+TCP. Returns JPEG bytes."""
         server_ip = SERVER_IP or detect_server_ip()
         photo_data = None
         photo_event = threading.Event()
@@ -238,11 +306,10 @@ class EmoConnection:
             srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             srv.bind(("0.0.0.0", PHOTO_PORT))
             srv.listen(1)
-            srv.settimeout(15)
+            srv.settimeout(20)
             try:
                 conn, addr = srv.accept()
                 logger.info(f"Photo TCP from {addr}")
-                # Read header until #
                 header = b""
                 while b"#" not in header:
                     chunk = conn.recv(1)
@@ -257,15 +324,13 @@ class EmoConnection:
                         parts[k] = v
                 filesize = int(parts.get("filesize", 0))
                 logger.info(f"Photo: {parts.get('name')}, {filesize} bytes")
-                # Read JPEG data
                 data = b""
                 while len(data) < filesize:
                     chunk = conn.recv(min(filesize - len(data), 8192))
                     if not chunk:
                         break
                     data += chunk
-                # Read trailing delimiter
-                conn.recv(1024)
+                conn.recv(1024)  # trailing delimiter
                 conn.close()
                 photo_data = data
                 logger.info(f"Photo received: {len(data)} bytes")
@@ -277,12 +342,10 @@ class EmoConnection:
                 srv.close()
                 photo_event.set()
 
-        # Start TCP server in background
         tcp_thread = threading.Thread(target=tcp_receiver, daemon=True)
         tcp_thread.start()
         await asyncio.sleep(0.3)
 
-        # Send BLE commands
         await self.send_request(encode_text('{"data":{"op":"in"},"type":"photo_req"}'), timeout=3)
         await asyncio.sleep(0.5)
         cmd = json.dumps({
@@ -291,7 +354,6 @@ class EmoConnection:
         })
         await self.send_request(encode_text(cmd), timeout=10)
 
-        # Wait for photo
         photo_event.wait(timeout=20)
         return photo_data
 
@@ -327,9 +389,11 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/health":
                 json_response(self, 200, {
                     "status": "ok",
-                    "connected": emo.connected,
+                    "connected": emo.is_alive,
                     "emo_addr": EMO_ADDR,
                     "adapter": BLE_ADAPTER,
+                    "reconnects": emo._reconnect_count,
+                    "last_ok_ago": round(time.monotonic() - emo._last_ok, 1) if emo._last_ok else None,
                 })
             elif path == "/status":
                 json_response(self, 200, self._run(emo.get_status()))
@@ -395,7 +459,6 @@ if __name__ == "__main__":
     emo.loop = loop
     threading.Thread(target=run_async_loop, args=(loop,), daemon=True).start()
 
-    # Auto-detect server IP
     if not SERVER_IP:
         SERVER_IP = detect_server_ip()
         logger.info(f"Server IP: {SERVER_IP}")
@@ -407,5 +470,8 @@ if __name__ == "__main__":
     except Exception as e:
         logger.warning(f"Auto-connect failed: {e}")
 
-    logger.info(f"EMO BLE Bridge on port {PORT}")
+    # Start watchdog
+    asyncio.run_coroutine_threadsafe(emo.watchdog(), loop)
+
+    logger.info(f"EMO BLE Bridge on port {PORT} (watchdog every {WATCHDOG_INTERVAL}s)")
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
